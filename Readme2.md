@@ -21,7 +21,7 @@ Note:
 
 Section: Code Repository Link
 
-[PASTE YOUR PUBLIC CODE REPOSITORY URL HERE]
+[(https://github.com/Aryan-del360/AI-Powered-Developer-Tool-Navigator)]
 
 Note: 
       I have Uploaded "app.py" (or 'search_script_final.py'), 'README.md', and other necessary files (like the chart image) to a public repository on GitHub, GitLab.  
