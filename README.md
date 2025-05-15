@@ -13,7 +13,7 @@ Select the following categories:
 
 Section: Demo Video Link
 
-[PASTE YOUR PUBLIC DEMO VIDEO URL HERE]
+(https://youtu.be/jXKPhXf-xqI?si=U1zrqeTOPVlaoJNV)
 
 Note:
      This YouTube video clearly shows your Streamlit app in action: entering a query, seeing results, using filters/sorting, viewing the chart, and reading the AI explanation.
