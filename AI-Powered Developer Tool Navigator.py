@@ -3,16 +3,18 @@
 import streamlit as st
 import os
 from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError, ConfigurationError
 import vertexai
 from vertexai.language_models import TextEmbeddingModel
 from vertexai.preview.generative_models import GenerativeModel, GenerationConfig, Part
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt # Removed, replaced by Plotly
 from collections import Counter
-import io # Needed to save matplotlib figure to a BytesIO object
+# import io # Removed, not needed for Plotly fig object
 from PIL import Image # Needed to display image from BytesIO
 import requests # Needed for optional Hugging Face calls
-import sys # For clean exit on critical errors
-import pandas as pd # Using pandas for easier data manipulation and display
+from google.cloud import language_v1 # Added for NLP Insights
+import pandas as pd # For Plotly chart DataFrame
+import plotly.express as px # For interactive charts
 
 # --- Streamlit Page Configuration ---
 st.set_page_config(
@@ -26,6 +28,7 @@ st.set_page_config(
 # We'll use a slightly more refined color palette and spacing
 st.markdown("""
 <style>
+<!-- IMPORTANT: Streamlit's auto-generated class names (e.g., .st-emotion-cache-xxxxxx) can change between Streamlit versions. If custom styles break after an update, these class names might need to be re-inspected and updated. -->
     /* Main page styling */
     .stApp {
         background-color: #f8f9fa; /* Very light grey background */
@@ -145,7 +148,20 @@ st.markdown("""
         color: #6c757d; /* Muted grey */
         font-size: 0.9rem;
     }
-
+    /* Make text input fields generally a bit larger and more prominent */
+    .stTextInput input {
+        font-size: 1.1rem; /* Slightly larger font */
+        padding: 0.8rem 1rem; /* Adjust padding for height */
+    }
+    .ai-explanation-box {
+        background-color: #e6f7ff; /* A light blue background */
+        border-left: 5px solid #007bff; /* Primary blue left border */
+        padding: 10px 15px;
+        margin-top: 10px;
+        margin-bottom: 15px; /* More space after the box */
+        border-radius: 0.3rem; /* Slightly more rounded corners than default alerts */
+        box-shadow: 0 1px 3px rgba(0,0,0,0.05); /* Subtle shadow */
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -185,7 +201,7 @@ def initialize_google_cloud():
         embedding_model = TextEmbeddingModel.from_pretrained(EMBEDDING_MODEL_NAME)
         gemini_text_model = GenerativeModel(GEMINI_TEXT_MODEL_ID)
 
-        st.sidebar.success("Google Cloud services initialized and models loaded.") # Use sidebar for status
+        st.sidebar.markdown("<span style='color:green; font-size: 16px; vertical-align: middle;'>●</span> <span style='vertical-align: middle;'>Google Cloud: Services initialized and models loaded.</span>", unsafe_allow_html=True)
         return embedding_model, gemini_text_model
 
     except Exception as e:
@@ -214,12 +230,30 @@ def get_mongo_client():
         cleaned_mongo_uri = MONGO_URI.strip('"')
         client = MongoClient(cleaned_mongo_uri, serverSelectionTimeoutMS=5000)
         client.admin.command('ismaster') # Check connection
-        st.sidebar.success("MongoDB Atlas connection successful!") # Use sidebar for status
+        st.sidebar.markdown("<span style='color:green; font-size: 16px; vertical-align: middle;'>●</span> <span style='vertical-align: middle;'>MongoDB Atlas: Connection successful!</span>", unsafe_allow_html=True)
         return client
-    except Exception as e:
-        st.sidebar.error(f"Error connecting to MongoDB Atlas: {e}") # Use sidebar for status
-        st.sidebar.warning("Please check your MONGO_URI environment variable (ensure it's correct and set) and network connection (IP whitelisting).")
-        st.stop() # Stop Streamlit execution
+    except ServerSelectionTimeoutError as e:
+        st.sidebar.error(f"MongoDB Connection Error: Server selection timed out. {e}")
+        st.sidebar.warning("This usually means the app could not find a suitable MongoDB server within the time limit (5 seconds). Check:")
+        st.sidebar.warning("1. Your MONGO_URI is correct and the server/cluster is running.")
+        st.sidebar.warning("2. Network connectivity (including VPNs or firewalls if applicable).")
+        st.sidebar.warning("3. IP Whitelisting on MongoDB Atlas if you are using it.")
+        st.sidebar.warning("4. If it's a replica set, ensure a primary is elected.")
+        st.stop()
+    except ConnectionFailure as e:
+        st.sidebar.error(f"MongoDB Connection Error: Failed to connect. {e}")
+        st.sidebar.warning("This can be due to various network issues (DNS, firewall, intermittent connectivity) or incorrect MONGO_URI.")
+        st.sidebar.warning("Please verify your MONGO_URI and network settings.")
+        st.stop()
+    except ConfigurationError as e:
+        st.sidebar.error(f"MongoDB Configuration Error: {e}")
+        st.sidebar.warning("There's an issue with the MongoDB connection string or configuration options.")
+        st.sidebar.warning("Please double-check your MONGO_URI format and any specified options.")
+        st.stop()
+    except Exception as e:  # Generic fallback
+        st.sidebar.error(f"An unexpected error occurred connecting to MongoDB Atlas: {e}")
+        st.sidebar.warning("Please check your MONGO_URI, network connection, and IP whitelisting if applicable.")
+        st.stop()
 
 mongo_client = get_mongo_client()
 db = mongo_client[MONGO_DB_NAME]
@@ -230,26 +264,27 @@ collection = db[MONGO_COLLECTION_NAME]
 def get_embedding(text_content: str) -> list[float]:
     """Generates embedding for a given text using Vertex AI."""
     try:
-        max_chars = 25000
+        # Max 2048 tokens for text-embedding-004. Using 7500 chars as a proxy.
+        max_chars = 7500
         if len(text_content) > max_chars:
-            st.warning(f"Warning: Text content for embedding is too long ({len(text_content)} chars). Truncating to {max_chars} chars.")
+            st.warning(f"Warning: Text content for embedding is too long ({len(text_content)} chars). Truncating to {max_chars} chars to attempt to meet underlying token limits.")
             text_content = text_content[:max_chars]
 
         embeddings = embedding_model.get_embeddings([text_content])
         return embeddings[0].values
 
     except Exception as e:
-        st.error(f"Error generating embedding for text: '{text_content[:100]}...' Error: {e}")
+        st.error(f"Error generating embedding for text: '{text_content[:100]}...' This could be due to the input text exceeding model token limits, or other API issues. Error: {e}")
         return None
 
 # --- Function to Generate Topic Bar Chart ---
-def generate_topic_chart(search_results: list, query_text: str) -> io.BytesIO | None:
-    """Generates a bar chart of the most frequent topics from search results and returns it as bytes."""
+def generate_topic_chart(search_results: list, query_text: str) -> object | None:
+    """Generates an interactive bar chart of the most frequent topics from search results using Plotly Express."""
     if not search_results:
         st.info("Skipping topic chart generation: No search results found.")
         return None
 
-    st.subheader("📊 Topic Distribution") # Added emoji
+    # st.subheader("📊 Topic Distribution") # Subheader moved to where chart is displayed
 
     all_topics = []
     for result in search_results:
@@ -266,42 +301,39 @@ def generate_topic_chart(search_results: list, query_text: str) -> io.BytesIO | 
         return None
 
     topic_counts = Counter(all_topics)
-    top_n = 10
+    top_n = 10 # Keep the top_n logic
     most_common_topics = topic_counts.most_common(top_n)
 
     if not most_common_topics:
+        # This logic to show all if top_n is too small but topics exist
         if len(topic_counts) > 0:
              most_common_topics = topic_counts.most_common()
              st.info(f"Only {len(most_common_topics)} unique topics found. Showing all.")
         else:
-             st.info("No topics found in search results for chart generation.")
-             return None
+             st.info("No topics found in search results for chart generation.") # Keep this
+             return None # Return None if no topics
 
-    topics, counts = zip(*most_common_topics)
+    df_topics = pd.DataFrame(most_common_topics, columns=['Topic', 'Frequency'])
 
-    fig, ax = plt.subplots(figsize=(10, 6)) # Create figure and axes
-    bars = ax.bar(topics, counts, color='#007bff') # Use a blue color
-    ax.set_xlabel("Topic", fontsize=12)
-    ax.set_ylabel("Frequency", fontsize=12)
-    ax.set_title(f"Top {len(most_common_topics)} Topics for Query: '{query_text[:50]}...'", fontsize=14)
-    plt.xticks(rotation=45, ha='right', fontsize=10)
-    plt.yticks(fontsize=10)
-    ax.grid(axis='y', linestyle='--', alpha=0.7)
-
-    for bar in bars:
-        yval = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width()/2.0, yval + 0.1, int(yval), va='bottom', ha='center', fontsize=9)
-
-    plt.tight_layout()
-
-    # Save plot to a BytesIO object
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png')
-    buf.seek(0) # Rewind the buffer to the beginning
-    plt.close(fig) # Close the figure to free memory
-
-    st.success("Topic bar chart generated.")
-    return buf
+    fig = px.bar(
+        df_topics,
+        x='Topic',
+        y='Frequency',
+        title=f"Top {len(df_topics)} Topics for Query: '{query_text[:50]}...'",
+        color='Frequency',
+        color_continuous_scale=px.colors.sequential.Blues_r, # Reversed Blues for darker high values
+        text_auto=True # Display values on bars
+    )
+    fig.update_layout(
+        xaxis_title="Topic",
+        yaxis_title="Frequency",
+        title_font_size=16,
+        xaxis_tickangle=-45,
+        # Optional: Add some margin for x-axis labels if they get cut off
+        margin=dict(b=100) # b is bottom margin
+    )
+    fig.update_traces(textposition='outside') # Ensure text is outside bars if text_auto places it inside
+    return fig
 
 # --- Function to Generate Explanation using Gemini API (via Vertex AI) ---
 def generate_explanation(summary_text: str) -> str:
@@ -310,7 +342,6 @@ def generate_explanation(summary_text: str) -> str:
         st.info("No valid summary text provided for explanation.")
         return "No explanation generated."
 
-    st.subheader("✨ AI Explanation") # Added emoji
     # st.info(f"Attempting to generate explanation for summary: '{summary_text[:100]}...'") # Removed verbose info
 
     try:
@@ -340,6 +371,66 @@ def generate_explanation(summary_text: str) -> str:
         st.warning("Details: Check your GCP credentials and ensure the text model is enabled and available in your Vertex AI region.")
         return "Error generating explanation."
 
+
+# --- Function for NLP Insights ---
+@st.cache_data(show_spinner=False) # Cache NLP results
+def get_nlp_insights(text_content: str) -> dict:
+    """
+    Analyzes text for entities and sentiment using Google Cloud Natural Language API.
+    """
+    insights = {"entities": [], "document_sentiment": None, "error": None}
+    if not text_content or not isinstance(text_content, str) or len(text_content.strip()) == 0:
+        insights["error"] = "No text content provided for NLP analysis."
+        return insights
+    try:
+        client = language_v1.LanguageServiceClient()
+        document = language_v1.types.Document(content=text_content, type_=language_v1.types.Document.Type.PLAIN_TEXT)
+        
+        # Analyze entity sentiment
+        # For more features, consider client.analyze_entities() and client.analyze_sentiment() separately
+        response = client.analyze_entity_sentiment(document=document, encoding_type=language_v1.EncodingType.UTF8)
+        
+        # Document sentiment
+        doc_sentiment = response.document_sentiment
+        insights["document_sentiment"] = {"score": doc_sentiment.score, "magnitude": doc_sentiment.magnitude}
+        
+        # Entities
+        for entity in response.entities:
+            insights["entities"].append({
+                "name": entity.name,
+                "type": language_v1.types.Entity.Type(entity.type_).name,
+                "salience": entity.salience,
+                "sentiment_score": entity.sentiment.score,
+                "sentiment_magnitude": entity.sentiment.magnitude
+            })
+        
+        # Sort entities by salience (descending)
+        insights["entities"].sort(key=lambda x: x["salience"], reverse=True)
+        
+    except Exception as e:
+        insights["error"] = str(e)
+        # st.warning(f"NLP processing failed for some text: {e}") # Silent for now
+    return insights
+
+# --- Keyword Lens Helper Functions ---
+def get_query_keywords(query_text: str) -> list[str]:
+    if not query_text: 
+        return []
+    # Simple keyword extraction: lowercase, split by space, ignore short words (<=2 chars)
+    return [word.lower() for word in query_text.split() if len(word) > 2]
+
+def count_keyword_mentions(text_content: str, keywords: list[str]) -> int:
+    if not text_content or not keywords: 
+        return 0
+    text_lower = text_content.lower()
+    text_words = text_lower.split() # Simple split, could be improved with regex for punctuation
+    word_counts = Counter(text_words)
+    
+    count = 0
+    for keyword in keywords:
+        count += word_counts.get(keyword, 0)
+    return count
+
 # --- Session State Initialization ---
 if 'search_results' not in st.session_state:
     st.session_state['search_results'] = []
@@ -349,6 +440,9 @@ if 'search_history' not in st.session_state:
     st.session_state['search_history'] = []
 if 'favorite_tools' not in st.session_state:
     st.session_state['favorite_tools'] = {} # Using a dictionary to store favorites by a unique key (e.g., description + url)
+if 'selected_lens' not in st.session_state: # For Keyword Focus Lens
+    st.session_state['selected_lens'] = "Standard View"
+
 
 # --- Helper function to add/remove favorites ---
 def toggle_favorite(result, is_favorite):
@@ -370,10 +464,10 @@ st.title("🛠️ AI-Powered Developer Tool Navigator") # Added emoji and refine
 st.markdown("Discover the **best AI tools** to speed up your development process, powered by **MongoDB Atlas** and **Google Cloud AI**.") # Refined description
 
 # Get search query from user input
-query_text = st.text_input("Enter your search query (e.g., 'AI tools for generating images', 'libraries for building chatbots'):", value=st.session_state['query_text']) # Set initial value from state
+query_text = st.text_input("🔎 Enter your search query (e.g., 'AI tools for generating images', 'libraries for building chatbots'):", value=st.session_state['query_text']) # Set initial value from state
 
 # Button to trigger the search
-if st.button("Search"):
+if st.button("Search 🚀"):
     if not query_text:
         st.warning("Please enter a search query.")
     else:
@@ -433,7 +527,7 @@ if st.button("Search"):
                         raw_summary_text = f"No search results were found for the query: '{query_text}'."
                         st.subheader("✨ AI Explanation") # Added emoji
                         explanation = generate_explanation(raw_summary_text)
-                        st.write(explanation)
+                        st.markdown(f"<div class='ai-explanation-box'>{explanation}</div>", unsafe_allow_html=True)
 
 
                 except Exception as e:
@@ -450,9 +544,25 @@ if 'search_results' in st.session_state and st.session_state['search_results']:
     current_results = st.session_state['search_results']
     current_query_text = st.session_state['query_text']
 
-    # --- Sidebar Filters ---
+    # --- Sidebar Filters & Lens ---
     st.sidebar.markdown("---")
-    st.sidebar.subheader("⚙️ Filter Results") # Added emoji
+    st.sidebar.subheader("⚙️ Filter & View Options") # Updated subheader
+
+    # Lens Selection
+    lens_options = ["Standard View", "Keyword Focus Lens"]
+    # Ensure default index is correctly found if selected_lens was not yet in session_state or was None
+    default_lens_index = 0
+    if 'selected_lens' in st.session_state and st.session_state.selected_lens in lens_options:
+        default_lens_index = lens_options.index(st.session_state.selected_lens)
+    
+    # Update session state based on widget - Streamlit handles rerun on change
+    st.session_state.selected_lens = st.sidebar.selectbox(
+        "Select Data Lens:", 
+        options=lens_options, 
+        key="data_lens_selection_widget", # Unique key for the widget itself
+        index=default_lens_index
+    )
+
 
     # Extract all unique topics for the filter
     all_topics_in_results = set()
@@ -562,7 +672,7 @@ if 'search_results' in st.session_state and st.session_state['search_results']:
                     col1, col2 = st.columns([3, 1]) # Adjust column ratio as needed
 
                     with col1:
-                        st.markdown(f"**Score:** `{score:.4f}`") # Format score and use code formatting for emphasis
+                        st.caption(f"Score: {score:.4f}")
                         st.write(f"**Description:** {description}")
 
                         if project_url and project_url != 'N/A':
@@ -571,9 +681,16 @@ if 'search_results' in st.session_state and st.session_state['search_results']:
                              st.write("**URL:** N/A")
 
                         if formatted_topics: # Use the initialized variable
-                            st.write(f"**Topics:** {', '.join(formatted_topics)}")
+                            st.caption(f"Topics: {', '.join(formatted_topics)}")
                         else:
-                            st.write("**Topics:** N/A")
+                            st.caption("Topics: N/A")
+                        
+                        if st.session_state.get('selected_lens') == "Keyword Focus Lens":
+                            query_keywords = get_query_keywords(st.session_state.get('query_text', ''))
+                            if query_keywords:
+                                keyword_count = count_keyword_mentions(description, query_keywords)
+                                st.caption(f"Keyword Mentions (from query): {keyword_count}")
+
 
                     with col2:
                          # Add the Save to Favorites button
@@ -592,6 +709,24 @@ if 'search_results' in st.session_state and st.session_state['search_results']:
                          st.write(f"- **Key Themes:** *{', '.join(formatted_topics[:5])}*") # Limit topics for insight, use italics
                     # Add a placeholder for "Why it's relevant to your query" - this would ideally involve more AI analysis
                     st.write(f"- **Potential Relevance:** *Based on your query and its similarity score ({score:.4f}), this tool is likely relevant for tasks involving [mention potential use case based on query/topics].*")
+                    
+                    # --- NLP Insights Integration ---
+                    if description and description != 'N/A':
+                        st.markdown("<h6>NLP Insights:</h6>", unsafe_allow_html=True)
+                        nlp_insights = get_nlp_insights(description)
+                        if nlp_insights.get("error"):
+                            st.caption("NLP Insights: Could not be processed.")
+                        else:
+                            if nlp_insights.get("document_sentiment"):
+                                sentiment_score = nlp_insights["document_sentiment"]["score"]
+                                sentiment_label = "Positive" if sentiment_score > 0.25 else "Negative" if sentiment_score < -0.25 else "Neutral"
+                                st.caption(f"Overall Sentiment: {sentiment_label} (Score: {sentiment_score:.2f}, Magnitude: {nlp_insights['document_sentiment']['magnitude']:.2f})")
+                            
+                            if nlp_insights.get("entities"):
+                                st.caption("Key Entities (Salience | Sentiment Score):")
+                                for entity_info in nlp_insights["entities"][:3]: # Display top 3
+                                    st.caption(f"- {entity_info['name']} ({entity_info['type']}) | {entity_info['salience']:.2f} | {entity_info['sentiment_score']:.2f}")
+                    st.markdown("---") # Final separator for the card
 
 
                 # Collect data for summary for explanation (from top 5)
@@ -608,8 +743,9 @@ if 'search_results' in st.session_state and st.session_state['search_results']:
                  raw_summary_text += "\n\nRelevant URLs include: " + ", ".join(result_urls[:3])
 
             # --- Generate Explanation from TOP 5 results ---
+            st.subheader("✨ AI Explanation") # Added emoji
             explanation = generate_explanation(raw_summary_text)
-            st.write(explanation)
+            st.markdown(f"<div class='ai-explanation-box'>{explanation}</div>", unsafe_allow_html=True)
 
 
         # --- Display Other Relevant Results ---
@@ -632,7 +768,8 @@ if 'search_results' in st.session_state and st.session_state['search_results']:
 
 
                 # Format score here for display
-                st.markdown(f"**{len(top_5_results) + i + 1}. Score: `{score:.4f}`**") # Format score and use code formatting
+                st.markdown(f"**{len(top_5_results) + i + 1}.**")
+                st.caption(f"Score: {score:.4f}")
                 st.write(f"Description: {description[:150]}...") # Shorter description
                 if project_url and project_url != 'N/A':
                      # Use columns for link button and favorite button on other results
@@ -656,9 +793,16 @@ if 'search_results' in st.session_state and st.session_state['search_results']:
 
 
                 if formatted_topics: # Use the initialized variable
-                    st.write(f"Topics: {', '.join(formatted_topics[:5])}") # Limit topics displayed
+                    st.caption(f"Topics: {', '.join(formatted_topics[:5])}") # Limit topics displayed
                 else:
-                     st.write("Topics: N/A")
+                     st.caption("Topics: N/A")
+                
+                if st.session_state.get('selected_lens') == "Keyword Focus Lens":
+                    query_keywords = get_query_keywords(st.session_state.get('query_text', ''))
+                    if query_keywords:
+                        keyword_count = count_keyword_mentions(result.get('description', ''), query_keywords)
+                        st.caption(f"Keyword Mentions (from query): {keyword_count}")
+                
                 st.markdown("---") # Separator
 
 
@@ -668,9 +812,11 @@ if 'search_results' in st.session_state and st.session_state['search_results']:
 
         # --- Generate Topic Bar Chart from ALL Filtered/Sorted results ---
         # Pass sorted_results (the full list after filtering/sorting) to the chart function
-        chart_buffer = generate_topic_chart(sorted_results, current_query_text)
-        if chart_buffer:
-             st.image(chart_buffer, caption="Top Topics in Filtered Results")
+        st.subheader("📊 Topic Distribution") # Added emoji
+        plotly_fig = generate_topic_chart(sorted_results, current_query_text)
+        if plotly_fig:
+            st.success("Interactive topic bar chart generated.") # Message before showing chart
+            st.plotly_chart(plotly_fig, use_container_width=True)
 
         # --- Display Search History ---
         st.sidebar.markdown("---")
@@ -703,7 +849,7 @@ if 'search_results' in st.session_state and st.session_state['search_results']:
         raw_summary_text = f"No search results match the filters for the query: '{current_query_text}'."
         st.subheader("✨ AI Explanation") # Added emoji
         explanation = generate_explanation(raw_summary_text)
-        st.write(explanation)
+        st.markdown(f"<div class='ai-explanation-box'>{explanation}</div>", unsafe_allow_html=True)
 
 # --- Footer ---
 st.markdown("---")
