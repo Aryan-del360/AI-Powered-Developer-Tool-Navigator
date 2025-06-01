@@ -1,0 +1,8 @@
+streamlit
+pymongo
+google-cloud-aiplatform
+matplotlib
+Pillow
+requests
+pandas
+google-auth
