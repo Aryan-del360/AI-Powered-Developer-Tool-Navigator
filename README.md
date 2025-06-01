@@ -1,5 +1,6 @@
 
 Project Title: AI-Powered Developer Tool Navigator
+
 Tagline: Find the right developer tools instantly with AI-driven semantic search.
 
 
