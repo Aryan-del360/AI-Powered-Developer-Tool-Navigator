@@ -1,3 +1,4 @@
+# AI-Powered Developer Tool Navigator
 
 Project Title: AI-Powered Developer Tool Navigator
 
@@ -11,9 +12,6 @@ Select the following categories:
 2. Cloud Computing
 3. Databases
 4. Developer Tools
-
-# AI-Powered Developer Tool Navigator
-
 This project, developed during a Google Hackathon, is an intelligent assistant designed to help developers find the best tools...
 
 **🚀 Live Application:** [https://developer-tool-navigator-518874921401.europe-west1.run.app/](https://developer-tool-navigator-518874921401.europe-west1.run.app/)
