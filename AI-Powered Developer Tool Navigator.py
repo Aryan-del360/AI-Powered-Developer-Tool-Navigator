@@ -707,7 +707,7 @@ if 'search_results' in st.session_state and st.session_state['search_results']:
 
 # --- Footer ---
 st.markdown("---")
-st.markdown("Built for the [MongoDB Hackathon] using MongoDB Atlas and Google Cloud AI.") # Add your hackathon name
+st.markdown("Built for the MongoDB Hackathon using MongoDB Atlas and Google Cloud AI.") # Add your hackathon name
 
 # Note: MongoDB client is automatically closed by Streamlit when the app stops.
 # No explicit client.close() needed here like in the command-line script.
